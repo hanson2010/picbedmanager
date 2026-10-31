@@ -26,7 +26,7 @@ Set all of these environment variables:
 python upload_to_cloudflare.py [-nc] image [image ...]
 ```
 
-`image` is a local path or an `http(s)` URL. `-nc`, `--no-crop` keeps images wider than 2:1 uncropped.
+`image` is a local path or an `http(s)` URL. A URL starting with `<R2_BASE_URL>/` is printed unchanged, without being downloaded or uploaded. `-nc`, `--no-crop` keeps images wider than 2:1 uncropped.
 
 Each image is uploaded as `<R2_BASE_URL>/<year>/<month>/<md5>.png` after these changes:
 

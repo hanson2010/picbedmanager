@@ -123,6 +123,11 @@ def upload_image(client, png_data):
 
 def process_image(client, image, crop_wide=True):
     """Download if needed, convert and upload one image. Return its URL, or None on failure."""
+    if image.startswith(f"{BASE_URL}/"):
+        log(f"Already hosted: {image}")
+        log("---")
+        return image
+
     if is_url(image):
         log(f"Downloading: {image}")
         try:

@@ -1,48 +1,135 @@
 #!/usr/bin/env python3
-"""Convert images to palette PNGs, upload them to Cloudflare R2 and print their public URLs."""
+"""Upload files to Cloudflare R2 and print their public URLs. Images are converted to palette PNGs
+first; SVGs and other files are uploaded unchanged."""
 
 import argparse
 import hashlib
+import mimetypes
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from http.client import HTTPException
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pillow_heif import register_heif_opener
 
-BUCKET = os.environ.get("R2_BUCKET", "my-bucket")
-ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", f"https://{BUCKET}.r2.cloudflarestorage.com")
-BASE_URL = os.environ.get("R2_BASE_URL", "https://assets.example.com")
+register_heif_opener()
+
+ENV_VARS = (
+    "R2_ENDPOINT_URL",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_BUCKET",
+    "R2_BASE_URL",
+)
 
 MAX_DOWNLOAD_BYTES = 50_000_000
 DOWNLOAD_TIMEOUT_SECONDS = 30
 MAX_DIMENSION = 2048
 PALETTE_COLORS = 256
 
+# XML declaration, processing instructions, comments and doctype, then the <svg> root element.
+SVG_PATTERN = re.compile(
+    rb"\s*(<\?.*?\?>\s*|<!--.*?-->\s*|<!DOCTYPE[^>\[]*(\[.*?\])?\s*>\s*)*<svg[\s>]", re.DOTALL
+)
+
+# Text types that are not text/*. All text is served as text/plain so that HTML, XML and
+# scripts are never rendered or run from the bucket's domain.
+TEXT_MIME_TYPES = {
+    "application/ecmascript",
+    "application/javascript",
+    "application/json",
+    "application/x-sh",
+    "application/xml",
+}
+
+
+@dataclass(frozen=True)
+class Settings:
+    endpoint_url: str
+    access_key_id: str
+    secret_access_key: str
+    bucket: str
+    base_url: str
+
 
 def log(message):
     print(message, file=sys.stderr)
+
+
+def load_settings():
+    """Return Settings read from ENV_VARS, or None after logging any that are unset."""
+    values = {name: os.environ.get(name, "") for name in ENV_VARS}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        log(f"Error: {', '.join(missing)} must be set.")
+        return None
+    return Settings(
+        endpoint_url=values["R2_ENDPOINT_URL"],
+        access_key_id=values["R2_ACCESS_KEY_ID"],
+        secret_access_key=values["R2_SECRET_ACCESS_KEY"],
+        bucket=values["R2_BUCKET"],
+        base_url=values["R2_BASE_URL"],
+    )
 
 
 def is_url(value):
     return re.match(r"https?://", value) is not None
 
 
-def download_image(url):
-    """Return the bytes of the image at url, or raise if it is too large or not an image."""
+def is_svg(data):
+    return SVG_PATTERN.match(data.removeprefix(b"\xef\xbb\xbf")) is not None
+
+
+def is_utf8_text(data):
+    if b"\x00" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def file_extension(source):
+    """Return the lowercase extension of a path or URL without the dot, or "" if it has none."""
+    path = PurePosixPath(unquote(urlparse(source).path)) if is_url(source) else Path(source)
+    extension = path.suffix.lower().removeprefix(".")
+    return extension if extension.isascii() and extension.isalnum() else ""
+
+
+def guess_mime_type(extension):
+    return mimetypes.guess_type(f"file.{extension}")[0] if extension else None
+
+
+def passthrough_content_type(data, extension):
+    """Return the content type to serve a file that is uploaded unchanged with."""
+    mime_type = guess_mime_type(extension)
+    if is_utf8_text(data):
+        return "text/plain; charset=utf-8"
+    if mime_type and (
+        mime_type.startswith("text/") or mime_type.endswith("+xml") or mime_type in TEXT_MIME_TYPES
+    ):
+        return "text/plain"
+    return mime_type or "application/octet-stream"
+
+
+def download_file(url):
+    """Return the bytes of the file at url, or raise if it is too large."""
     request = Request(url, headers={"User-Agent": "picbedmanager"})
     with urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
         data = response.read(MAX_DOWNLOAD_BYTES + 1)
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise ValueError(f"file is larger than {MAX_DOWNLOAD_BYTES} bytes")
-    Image.open(BytesIO(data)).verify()
     return data
 
 
@@ -97,12 +184,12 @@ def convert_image(source, crop_wide=True):
         return _encode_palette_png(image)
 
 
-def create_client(access_key_id, secret_access_key):
+def create_client(settings):
     return boto3.client(
         "s3",
-        endpoint_url=ENDPOINT_URL,
-        aws_access_key_id=access_key_id,
-        aws_secret_access_key=secret_access_key,
+        endpoint_url=settings.endpoint_url,
+        aws_access_key_id=settings.access_key_id,
+        aws_secret_access_key=settings.secret_access_key,
         region_name="auto",
         config=Config(
             s3={"addressing_style": "path"},
@@ -113,49 +200,69 @@ def create_client(access_key_id, secret_access_key):
     )
 
 
-def upload_image(client, png_data):
-    """Upload PNG bytes as <year>/<month>/<md5>.png and return the public URL."""
+def upload_file(client, settings, data, extension, content_type):
+    """Upload bytes as <year>/<month>/<md5>[.<extension>] and return the public URL."""
     now = datetime.now()
-    key = f"{now:%Y}/{now:%m}/{hashlib.md5(png_data).hexdigest()}.png"
-    client.put_object(Bucket=BUCKET, Key=key, Body=png_data, ContentType="image/png")
-    return f"{BASE_URL}/{key}"
+    suffix = f".{extension}" if extension else ""
+    key = f"{now:%Y}/{now:%m}/{hashlib.md5(data).hexdigest()}{suffix}"
+    client.put_object(Bucket=settings.bucket, Key=key, Body=data, ContentType=content_type)
+    return f"{settings.base_url}/{key}"
 
 
-def process_image(client, image, crop_wide=True):
-    """Download if needed, convert and upload one image. Return its URL, or None on failure."""
-    if image.startswith(f"{BASE_URL}/"):
-        log(f"Already hosted: {image}")
+def process_file(client, settings, file, crop_wide=True):
+    """Download if needed, convert and upload one file. Return its URL, or None on failure.
+
+    SVGs are uploaded unchanged as image/svg+xml. Images Pillow can read are converted to
+    palette PNGs. Anything else is uploaded unchanged, unless its extension says it is an
+    image, in which case it is reported as a failed conversion.
+    """
+    if file.startswith(f"{settings.base_url}/"):
+        log(f"Already hosted: {file}")
         log("---")
-        return image
+        return file
 
-    if is_url(image):
-        log(f"Downloading: {image}")
+    if is_url(file):
+        log(f"Downloading: {file}")
         try:
-            source = BytesIO(download_image(image))
+            data = download_file(file)
+        except (OSError, HTTPException, ValueError) as error:
+            log(f"Download failed: {file} ({error})")
+            return None
+    elif Path(file).is_file():
+        try:
+            data = Path(file).read_bytes()
+        except OSError as error:
+            log(f"Read failed: {file} ({error})")
+            return None
+    else:
+        log(f"Skip: File not found - {file}")
+        return None
+
+    log(f"Processing: {file}")
+
+    extension = file_extension(file)
+    if is_svg(data):
+        extension, content_type = "svg", "image/svg+xml"
+    else:
+        try:
+            data = convert_image(BytesIO(data), crop_wide)
+            extension, content_type = "png", "image/png"
+        except UnidentifiedImageError as error:
+            if (guess_mime_type(extension) or "").startswith("image/"):
+                log(f"Conversion failed: {file} ({error})")
+                return None
+            content_type = passthrough_content_type(data, extension)
         # Pillow raises many exception types on corrupt input, so catch them all.
         except Exception as error:
-            log(f"Download failed: {image} ({error})")
+            log(f"Conversion failed: {file} ({error})")
             return None
-    elif Path(image).is_file():
-        source = image
-    else:
-        log(f"Skip: File not found - {image}")
-        return None
-
-    log(f"Processing: {image}")
-
-    try:
-        png_data = convert_image(source, crop_wide)
-    except Exception as error:
-        log(f"Conversion failed: {image} ({error})")
-        return None
 
     url = None
     try:
-        url = upload_image(client, png_data)
-        log(f"Uploaded: {image}")
+        url = upload_file(client, settings, data, extension, content_type)
+        log(f"Uploaded: {file}")
     except (BotoCoreError, ClientError, OSError, HTTPException) as error:
-        log(f"Upload failed: {image} ({error})")
+        log(f"Upload failed: {file} ({error})")
 
     log("---")
     return url
@@ -164,28 +271,25 @@ def process_image(client, image, crop_wide=True):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Credentials are read from R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY. "
-        "R2_BUCKET, R2_ENDPOINT_URL and R2_BASE_URL override the upload target.",
+        epilog=f"Requires the environment variables {', '.join(ENV_VARS)}.",
         allow_abbrev=False,
     )
-    parser.add_argument("images", nargs="*", metavar="image", help="local image path or http(s) URL")
+    parser.add_argument("files", nargs="*", metavar="file", help="local file path or http(s) URL")
     parser.add_argument(
         "-nc", "--no-crop", action="store_true", help="do not center-crop images wider than 2:1"
     )
     args = parser.parse_intermixed_args(argv)
 
-    if not args.images:
+    settings = load_settings()
+    if settings is None:
+        return 1
+
+    if not args.files:
         parser.print_usage(sys.stderr)
         return 1
 
-    access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
-    secret_access_key = os.environ.get("R2_SECRET_ACCESS_KEY")
-    if not access_key_id or not secret_access_key:
-        log("Error: R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY must be set.")
-        return 1
-
-    client = create_client(access_key_id, secret_access_key)
-    urls = [process_image(client, image, not args.no_crop) for image in args.images]
+    client = create_client(settings)
+    urls = [process_file(client, settings, file, not args.no_crop) for file in args.files]
 
     print()
     print("Public URLs:")
